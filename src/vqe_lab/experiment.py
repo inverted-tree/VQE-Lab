@@ -6,7 +6,7 @@ import itertools
 import time
 from dataclasses import dataclass, field
 from math import sqrt
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 from qiskit import QuantumCircuit
@@ -99,15 +99,34 @@ class Experiment:
         self.hamiltonian_kwargs = dict(hamiltonian)
         self.ansatz_kwargs = dict(ansatz or {})
 
-    def exact(self, *, return_eigenvector: bool = False) -> ExactResult:
-        """Dense-diagonalize the workload Hamiltonian."""
+    def exact(
+        self,
+        *,
+        return_eigenvector: bool = False,
+        particle_number: int | None = None,
+    ) -> ExactResult:
+        """Dense-diagonalize the Hamiltonian, optionally in a number sector."""
 
         start = time.perf_counter()
         operator = self._hamiltonian()
         matrix = np.asarray(operator.to_matrix(sparse=False), dtype=complex)
+        qubits = operator.num_qubits
+        metadata = self._metadata()
+        if particle_number is not None:
+            if not isinstance(particle_number, int) or not 0 <= particle_number <= qubits:
+                raise ValueError("particle_number must be between zero and the number of qubits.")
+            indices = np.asarray(
+                [index for index in range(2**qubits) if index.bit_count() == particle_number]
+            )
+            matrix = matrix[np.ix_(indices, indices)]
+            metadata["particle_number"] = particle_number
         if return_eigenvector:
             values, vectors = np.linalg.eigh(matrix)
-            vector: np.ndarray | None = vectors[:, 0]
+            if particle_number is None:
+                vector: np.ndarray | None = vectors[:, 0]
+            else:
+                vector = np.zeros(2**qubits, dtype=complex)
+                vector[indices] = vectors[:, 0]
         else:
             values = np.linalg.eigvalsh(matrix)
             vector = None
@@ -116,7 +135,7 @@ class Experiment:
             eigenvalues=np.asarray(values, dtype=float),
             eigenvector=vector,
             elapsed_time=time.perf_counter() - start,
-            metadata=self._metadata(),
+            metadata=metadata,
         )
 
     def vqe(
@@ -130,6 +149,7 @@ class Experiment:
         initial_point: np.ndarray | list[float] | None = None,
         initial_point_seed: int | None = None,
         initial_point_bounds: tuple[float, float] = (-np.pi, np.pi),
+        optimizer_bounds: tuple[float, float] | list[tuple[float, float]] | None = None,
         optimizer_options: dict[str, Any] | None = None,
         backend_options: dict[str, Any] | None = None,
         entropy_partition: int | Iterable[int] | None = None,
@@ -167,7 +187,10 @@ class Experiment:
         built_optimizer = _make_optimizer(
             optimizer, maxiter, optimizer_options or {}, seed
         )
-        raw_result = built_optimizer.minimize(fun=objective, x0=point)
+        bounds = _make_optimizer_bounds(optimizer_bounds, circuit.num_parameters)
+        raw_result = built_optimizer.minimize(
+            fun=objective, x0=point, **({"bounds": bounds} if bounds is not None else {})
+        )
         if not energies:
             objective(np.asarray(getattr(raw_result, "x", point), dtype=float))
         metadata = self._metadata()
@@ -177,6 +200,7 @@ class Experiment:
                 "shots": shots,
                 "optimizer": type(built_optimizer).__name__,
                 "maxiter": maxiter,
+                "optimizer_bounds": bounds,
                 **_two_qubit_metadata(circuit),
             }
         )
@@ -239,12 +263,25 @@ def run_grid(
     ansatz_grid: dict[str, Iterable[Any]] | None = None,
     repeats: int = 1,
     seed: int | None = None,
+    initial_point_factory: Callable[[dict[str, Any], int | None], np.ndarray | list[float]] | None = None,
     **vqe_kwargs: Any,
 ) -> ExperimentResults:
-    """Run the Cartesian product of naturally named Hamiltonian and ansatz grids."""
+    """Run the Cartesian product of naturally named Hamiltonian and ansatz grids.
+
+    ``initial_point_factory`` receives each resolved configuration and its seeded
+    run index, allowing workload- or phase-specific repeated starts.
+    """
 
     if not isinstance(repeats, int) or repeats <= 0:
         raise ValueError("repeats must be a positive integer.")
+    if initial_point_factory is not None and not callable(initial_point_factory):
+        raise TypeError("initial_point_factory must be callable.")
+    if initial_point_factory is not None and (
+        "initial_point" in vqe_kwargs or "initial_point_seed" in vqe_kwargs
+    ):
+        raise ValueError(
+            "initial_point_factory cannot be combined with initial_point or initial_point_seed."
+        )
     configurations = itertools.product(
         _grid_configurations(hamiltonian_grid),
         _grid_configurations(ansatz_grid),
@@ -265,7 +302,11 @@ def run_grid(
         }
         try:
             run_kwargs = dict(vqe_kwargs)
-            if (
+            if initial_point_factory is not None:
+                run_kwargs["initial_point"] = initial_point_factory(
+                    configuration, None if seed is None else seed + index
+                )
+            elif (
                 "initial_point" not in run_kwargs
                 and "initial_point_seed" not in run_kwargs
             ):
@@ -354,6 +395,31 @@ def _grid_configurations(
         dict(zip(keys, combination, strict=True))
         for combination in itertools.product(*values)
     ]
+
+
+def _make_optimizer_bounds(
+    bounds: tuple[float, float] | list[tuple[float, float]] | None,
+    num_parameters: int,
+) -> list[tuple[float, float]] | None:
+    if bounds is None:
+        return None
+    if isinstance(bounds, tuple) and len(bounds) == 2 and all(
+        np.isscalar(value) for value in bounds
+    ):
+        values = [bounds] * num_parameters
+    else:
+        values = list(bounds)
+    if len(values) != num_parameters:
+        raise ValueError("optimizer_bounds must define one bound per parameter.")
+    normalized = []
+    for bound in values:
+        if not isinstance(bound, tuple) or len(bound) != 2:
+            raise ValueError("Each optimizer bound must be a (low, high) tuple.")
+        low, high = map(float, bound)
+        if not np.isfinite(low) or not np.isfinite(high) or low > high:
+            raise ValueError("Optimizer bounds must be finite and satisfy low <= high.")
+        normalized.append((low, high))
+    return normalized
 
 
 def _make_optimizer(
