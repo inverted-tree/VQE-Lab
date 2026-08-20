@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Data
+notebooks/fe_nta/Fe3_NTA_doublet_CASSCF/
