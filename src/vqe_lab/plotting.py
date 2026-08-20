@@ -31,11 +31,15 @@ def draw_ansatz(
 def plot_convergence(
     results: ResultGroups, *, exact: ExactResult | float | None = None
 ) -> plt.Axes:
-    """Plot evaluated energy histories, including group mean envelopes."""
+    """Plot best-so-far energy histories, including group mean envelopes."""
 
     figure, axis = plt.subplots()
     for label, group in _groups(results):
-        _plot_history(axis, [run.energy_history for run in group], label)
+        _plot_history(
+            axis,
+            [np.minimum.accumulate(run.energy_history) for run in group],
+            label,
+        )
     if exact is not None:
         axis.axhline(_exact_energy(exact), color="black", linestyle="--", label="exact")
     axis.set(xlabel="Objective evaluation", ylabel="Energy", title="VQE convergence")
